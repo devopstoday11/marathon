@@ -23,7 +23,7 @@ class ConstraintsTest extends UnitTest {
   val rackIdField = "rackid"
   val jdkField = "jdk"
 
-  case class meetConstraint(field: String, operator: Operator, value: String, placed: Seq[Placed] = Nil) extends Matcher[Offer] {
+  case class meetConstraint(field: String, operator: Operator, value: String, placed: Seq[Instance] = Nil) extends Matcher[Offer] {
     override def apply(offer: Offer): MatchResult = {
       val constraint = makeConstraint(field, operator, value)
       val matched = Constraints.meetsConstraint(placed, offer, constraint)
@@ -39,7 +39,7 @@ class ConstraintsTest extends UnitTest {
         s"Offer matched constraint\n${description}")
     }
 
-    def withPlacements(newPlaced: Placed*): meetConstraint = copy(placed = newPlaced.toList)
+    def withPlacements(newPlaced: Instance*): meetConstraint = copy(placed = newPlaced.toList)
   }
 
   "Constraints" should {
@@ -717,8 +717,17 @@ class ConstraintsTest extends UnitTest {
     builder.build
   }
 
+  private def makeInstanceForRunSpec(runSpec: state.RunSpec, attributes: String = "", host: String = "host", region: Option[String] = None, zone: Option[String] = None): Instance = {
+    TestInstanceBuilder.newBuilderForRunSpec(runSpec).addTaskWithBuilder().taskRunning()
+      .withNetworkInfo(hostName = Some(host), hostPorts = Seq(999))
+      .build()
+      .withAgentInfo(hostName = Some(host), region = region, zone = zone, attributes = Some(parseAttrs(attributes)))
+      .getInstance()
+  }
+
   private def makeInstance(appId: AbsolutePathId, attributes: String = "", host: String = "host", region: Option[String] = None, zone: Option[String] = None): Instance = {
-    TestInstanceBuilder.newBuilder(appId).addTaskWithBuilder().taskRunning()
+    val runSpec = Builders.newAppDefinition.command(appId, instances = 1)
+    TestInstanceBuilder.newBuilderForRunSpec(runSpec).addTaskWithBuilder().taskRunning()
       .withNetworkInfo(hostName = Some(host), hostPorts = Seq(999))
       .build()
       .withAgentInfo(hostName = Some(host), region = region, zone = zone, attributes = Some(parseAttrs(attributes)))

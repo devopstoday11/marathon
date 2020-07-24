@@ -114,7 +114,7 @@ object Constraints extends StrictLogging {
         case (_, count) =>
           Math.max(0, count - desiredCountPerGroup)
       }.sum
-      def remainderUnused: Boolean = (remainderConsumed - remainder) > 0
+      def remainderUnused: Boolean = (remainder - remainderConsumed) > 0
 
       val countInOfferGroup = currentCountPerGroup.collectFirst {
         case (Some(v), groupCount) if v == offerValue =>

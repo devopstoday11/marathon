@@ -109,16 +109,16 @@ object Constraints extends StrictLogging {
       checkConstraint(offerReader(offer), placedReader)
     }
 
-    private def checkGroupBy(offerValue: String, groupFunc: (Instance) => Option[String]): Boolean = {
+    private def checkGroupBy(offerValue: String, groupFunc: Instance => Option[String]): Boolean = {
       val desiredInstanceCount: Int = allInstances.headOption.map(_.runSpec.instances).getOrElse(1)
       val desiredGroupCount: Int = List(GroupByDefault, getIntValue(constraintValue, GroupByDefault)).max
 
       val currentCountPerGroup = allInstances.groupBy(groupFunc).map { case (k, v) => k -> v.size }
-      val desiredCountPerGroup: Int = (desiredInstanceCount / desiredGroupCount)
+      val desiredCountPerGroup: Int = desiredInstanceCount / desiredGroupCount
       val remainder = desiredInstanceCount % desiredGroupCount
       val remainderConsumed = currentCountPerGroup.map {
-        case (_, count) =>
-          Math.max(0, count - desiredCountPerGroup)
+        case (_, currentCount) =>
+          Math.max(0, currentCount - desiredCountPerGroup)
       }.sum
       def remainderUnused: Boolean = (remainder - remainderConsumed) > 0
 

@@ -22,11 +22,12 @@ object Constraints extends StrictLogging {
 
   private val GroupByDefault = 0
 
-  private def getIntValue(s: String, default: Int): Int = s match {
-    case "inf" => Integer.MAX_VALUE
-    case Int(x) => x
-    case _ => default
-  }
+  private def getIntValue(s: String, default: Int): Int =
+    s match {
+      case "inf" => Integer.MAX_VALUE
+      case Int(x) => x
+      case _ => default
+    }
 
   /**
     * Decimal formatter to the 1000th precision. Does not include zeros after the decimal. Rounding mode
@@ -40,29 +41,33 @@ object Constraints extends StrictLogging {
   private val decimalFormatter =
     new DecimalFormat("0.###")
 
-  private def getValueString(attribute: Attribute): String = attribute.getType match {
-    case Value.Type.SCALAR =>
-      decimalFormatter.format(attribute.getScalar.getValue)
-    case Value.Type.TEXT =>
-      attribute.getText.getValue
-    case Value.Type.RANGES =>
-      val s = attribute.getRanges.getRangeList.asScala.to(Seq)
-        .sortWith(_.getBegin < _.getBegin)
-        .map(r => s"${r.getBegin.toString}-${r.getEnd.toString}")
-        .mkString(",")
-      s"[$s]"
-    case Value.Type.SET =>
-      val s = attribute.getSet.getItemList.asScala.to(Seq).sorted.mkString(",")
-      s"{$s}"
-  }
+  private def getValueString(attribute: Attribute): String =
+    attribute.getType match {
+      case Value.Type.SCALAR =>
+        decimalFormatter.format(attribute.getScalar.getValue)
+      case Value.Type.TEXT =>
+        attribute.getText.getValue
+      case Value.Type.RANGES =>
+        val s = attribute.getRanges.getRangeList.asScala
+          .to(Seq)
+          .sortWith(_.getBegin < _.getBegin)
+          .map(r => s"${r.getBegin.toString}-${r.getEnd.toString}")
+          .mkString(",")
+        s"[$s]"
+      case Value.Type.SET =>
+        val s = attribute.getSet.getItemList.asScala.to(Seq).sorted.mkString(",")
+        s"{$s}"
+    }
 
   type FieldReader = (Offer => Option[String], Instance => Option[String])
   private val hostnameReader: FieldReader = (offer => Some(offer.getHostname), placed => placed.hostname)
   private val regionReader: FieldReader = (OfferUtil.region(_), _.region)
   private val zoneReader: FieldReader = (OfferUtil.zone(_), _.zone)
-  private def attributeReader(field: String): FieldReader = (
-    { offer => offer.getAttributesList.asScala.find(_.getName == field).map(getValueString) },
-    { p => p.attributes.find(_.getName == field).map(getValueString) })
+  private def attributeReader(field: String): FieldReader =
+    (
+      { offer => offer.getAttributesList.asScala.find(_.getName == field).map(getValueString) },
+      { p => p.attributes.find(_.getName == field).map(getValueString) }
+    )
 
   val hostnameField = "@hostname"
   val regionField = "@region"
@@ -82,10 +87,11 @@ object Constraints extends StrictLogging {
 
   private final class ConstraintsChecker(allInstances: Seq[Instance], offer: Offer, constraint: Constraint) {
     val constraintValue = constraint.getValue
-    def constraintValueAsScalar: Option[Double] = constraintValue match {
-      case MesosScalarValue(v) => Some(v.toDouble)
-      case _ => None
-    }
+    def constraintValueAsScalar: Option[Double] =
+      constraintValue match {
+        case MesosScalarValue(v) => Some(v.toDouble)
+        case _ => None
+      }
     def constraintValueAsSet: Option[Iterable[String]] = {
       constraintValue match {
         case MesosSetValue(inner) =>
@@ -199,8 +205,7 @@ object Constraints extends StrictLogging {
     * @param toKillCount the expected number of instances to select for kill
     * @return the selected instances to kill. The number of instances will not exceed toKill but can be less.
     */
-  def selectInstancesToKill(
-    runSpec: RunSpec, runningInstances: Seq[Instance], toKillCount: Int): Seq[Instance] = {
+  def selectInstancesToKill(runSpec: RunSpec, runningInstances: Seq[Instance], toKillCount: Int): Seq[Instance] = {
 
     require(toKillCount <= runningInstances.size, "Can not kill more instances than running")
 
@@ -222,8 +227,9 @@ object Constraints extends StrictLogging {
     var flag = true
     while (flag && toKillInstances.size != toKillCount) {
       val tried = distributions
-        //sort all distributions in descending order based on distribution difference
-        .toSeq.sortBy(_.distributionDifference(toKillInstances))(Ordering.Int.reverse)
+      //sort all distributions in descending order based on distribution difference
+      .toSeq
+        .sortBy(_.distributionDifference(toKillInstances))(Ordering.Int.reverse)
         //select instances to kill (without already selected ones)
         .flatMap(_.findInstancesToKill(toKillInstances)) ++
         //fallback: if the distributions did not select a instance, choose one of the not chosen ones

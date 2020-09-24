@@ -13,7 +13,6 @@ import mesosphere.marathon.core.launchqueue.impl.ReviveOffersStreamLogic.{IssueR
 import mesosphere.marathon.core.task.tracker.InstanceTracker
 import mesosphere.marathon.metrics.{Counter, Metrics}
 import org.apache.mesos.Protos.FrameworkInfo
-import org.apache.mesos.scheduler.Protos.OfferConstraints
 
 import scala.collection.JavaConverters._
 import scala.concurrent.Future
@@ -84,14 +83,11 @@ class ReviveOffersActor(
         .via(suppressReviveFlow)
         .via(reviveSuppressMetrics)
         .runWith(Sink.foreach {
-          case UpdateFramework(roleState, _, _) =>
+          case UpdateFramework(roleState, _, _, constraints) =>
             driverHolder.driver.foreach { d =>
               val newInfo = frameworkInfoWithRoles(frameworkInfo, roleState.keys)
               val suppressedRoles = roleState.iterator.collect { case (role, OffersNotWanted) => role }.toSeq
-              d.updateFramework(
-                  newInfo,
-                  suppressedRoles.asJava,
-                  OfferConstraints.getDefaultInstance())
+              d.updateFramework(newInfo, suppressedRoles.asJava, constraints.protobuf)
             }
 
           case IssueRevive(roles) =>
@@ -105,7 +101,7 @@ class ReviveOffersActor(
   }
 
   val reviveSuppressMetrics: Flow[RoleDirective, RoleDirective, NotUsed] = Flow[RoleDirective].map {
-    case directive @ UpdateFramework(newState, newlyRevived, newlySuppressed) =>
+    case directive @ UpdateFramework(newState, newlyRevived, newlySuppressed, newConstraints) =>
       newlyRevived.foreach { role =>
         logger.info(s"Role '${role}' newly revived via update framework call")
         reviveCountMetric.increment()
@@ -115,6 +111,8 @@ class ReviveOffersActor(
         logger.info(s"Role '${role}' newly suppressed via update framework call")
         suppressCountMetric.increment()
       }
+
+      logger.info(s"Setting offer constraints: ${newConstraints}")
       directive
 
     case directive @ IssueRevive(roles) =>

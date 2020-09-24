@@ -2,11 +2,14 @@ package mesosphere.marathon
 package core.launchqueue.impl
 
 import akka.NotUsed
+import akka.stream.FlowShape
 import akka.stream.OverflowStrategy
-import akka.stream.scaladsl.{Flow, Source}
+import akka.stream.scaladsl.{Broadcast, GraphDSL, Flow, Source, ZipLatestWith}
 import com.typesafe.scalalogging.StrictLogging
+
 import mesosphere.marathon.core.instance.update.{InstanceChangeOrSnapshot, InstanceDeleted, InstanceUpdated, InstancesSnapshot}
 import mesosphere.marathon.core.launchqueue.impl.ReviveOffersState.Role
+import mesosphere.marathon.core.launchqueue.impl.OfferConstraints
 import mesosphere.marathon.state.RunSpecConfigRef
 import mesosphere.marathon.stream.{RateLimiterFlow, TimedEmitter}
 
@@ -47,6 +50,17 @@ object ReviveOffersStreamLogic extends StrictLogging {
     }
   }
 
+  def offerConstraintsStateFromInstances(
+  ): Flow[InstanceChangeOrSnapshot, OfferConstraints.State, NotUsed] = {
+    Flow[InstanceChangeOrSnapshot].scan(OfferConstraints.State.empty) {
+      case (current, snapshot: InstancesSnapshot) => current.withSnapshot(snapshot)
+      case (current, InstanceUpdated(updated, _, _)) => current.withInstanceAddedOrUpdated(updated)
+      case (current, InstanceDeleted(deleted, _, _)) => current.withInstanceDeleted(deleted)
+    }
+  }
+
+  case class OffersState(roleReviveVersions: Map[Role, VersionedRoleState], offerConstraints: OfferConstraints.RoleState)
+
   /**
     * Core logic for suppress and revive
     *
@@ -64,23 +78,43 @@ object ReviveOffersStreamLogic extends StrictLogging {
       defaultRole: Role
   ): Flow[Either[InstanceChangeOrSnapshot, DelayedStatus], RoleDirective, NotUsed] = {
 
+    val rateLimitedOfferConstraintsRoleStateFlow = Flow[Either[InstanceChangeOrSnapshot, DelayedStatus]].collect {
+      case Left(update: InstanceChangeOrSnapshot) => update
+    }.via(offerConstraintsStateFromInstances)
+      .buffer(1, OverflowStrategy.dropHead) // While we are back-pressured, we drop older interim frames
+      .via(RateLimiterFlow.apply(minReviveOffersInterval)) // TODO: need a separate parameter
+      .map(_.roleState)
+
+    val rateLimitedRoleReviveVersionsFlow = reviveStateFromInstancesAndDelays(defaultRole)
+      .buffer(1, OverflowStrategy.dropHead) // While we are back-pressured, we drop older interim frames
+      .via(RateLimiterFlow.apply(minReviveOffersInterval))
+      .map(_.roleReviveVersions)
+
     val reviveRepeaterWithTicks = Flow[RoleDirective]
       .map(Left(_))
       .merge(Source.tick(minReviveOffersInterval, minReviveOffersInterval, Right(Tick)), eagerComplete = true)
       .via(reviveRepeater)
 
-    reviveStateFromInstancesAndDelays(defaultRole)
-      .buffer(1, OverflowStrategy.dropHead) // While we are back-pressured, we drop older interim frames
-      .via(RateLimiterFlow.apply(minReviveOffersInterval))
-      .map(_.roleReviveVersions)
+    Flow
+      .fromGraph(GraphDSL.create() { implicit b =>
+        import GraphDSL.Implicits._
+
+        val broadcast = b.add(Broadcast[Either[InstanceChangeOrSnapshot, DelayedStatus]](2, eagerCancel = true))
+        val zip = b.add(ZipLatestWith[Map[Role, VersionedRoleState], OfferConstraints.RoleState, OffersState](OffersState))
+
+        broadcast.out(0) ~> rateLimitedRoleReviveVersionsFlow ~> zip.in0
+        broadcast.out(1) ~> rateLimitedOfferConstraintsRoleStateFlow ~> zip.in1
+
+        FlowShape(broadcast.in, zip.out)
+      })
       .via(reviveDirectiveFlow(enableSuppress))
       .map(l => { logger.info(s"Issuing following suppress/revive directives: = ${l}"); l })
       .via(reviveRepeaterWithTicks)
   }
 
-  def reviveDirectiveFlow(enableSuppress: Boolean): Flow[Map[Role, VersionedRoleState], RoleDirective, NotUsed] = {
+  def reviveDirectiveFlow(enableSuppress: Boolean): Flow[OffersState, RoleDirective, NotUsed] = {
     val logic = if (enableSuppress) new ReviveDirectiveFlowLogicWithSuppression else new ReviveDirectiveFlowLogicWithoutSuppression
-    Flow[Map[Role, VersionedRoleState]]
+    Flow[OffersState]
       .sliding(2)
       .mapConcat({
         case Seq(lastState, newState) =>
@@ -98,15 +132,17 @@ object ReviveOffersStreamLogic extends StrictLogging {
     * There are two implementations for the logic, one with suppression, and the other with suppression disabled.
     */
   private[impl] trait ReviveDirectiveFlowLogic {
-    def lastOffersWantedVersion(lastState: Map[Role, VersionedRoleState], role: Role): Option[Long] =
-      lastState.get(role).collect { case VersionedRoleState(version, OffersWanted) => version }
+    def lastOffersWantedVersion(lastState: OffersState, role: Role): Option[Long] =
+      lastState.roleReviveVersions.get(role).collect { case VersionedRoleState(version, OffersWanted) => version }
 
-    def directivesForDiff(lastState: Map[Role, VersionedRoleState], newState: Map[Role, VersionedRoleState]): List[RoleDirective]
+    def directivesForDiff(lastState: OffersState, newState: OffersState): List[RoleDirective]
   }
 
   private[impl] class ReviveDirectiveFlowLogicWithoutSuppression extends ReviveDirectiveFlowLogic {
 
-    def directivesForDiff(lastState: Map[Role, VersionedRoleState], newState: Map[Role, VersionedRoleState]): List[RoleDirective] = {
+    def directivesForDiff(lastOffersState: OffersState, newOffersState: OffersState): List[RoleDirective] = {
+      val lastState = lastOffersState.roleReviveVersions
+      val newState = newOffersState.roleReviveVersions
       val rolesChanged = lastState.keySet != newState.keySet
       val directives = List.newBuilder[RoleDirective]
 
@@ -114,16 +150,22 @@ object ReviveOffersStreamLogic extends StrictLogging {
         val newRoleState = newState.keysIterator.map { role =>
           role -> OffersWanted
         }.toMap
+
+        /*
+         * NOTE: Without suppression, we don't set offer constraints
+         * to avoid screwing up Mesos allocator performance.
+         */
         val updateFramework = UpdateFramework(
           newRoleState,
           newlyRevived = newState.keySet -- lastState.keySet,
-          newlySuppressed = Set.empty
+          newlySuppressed = Set.empty,
+          OfferConstraints.RoleState.empty
         )
         directives += updateFramework
       }
       val needsExplicitRevive = newState.iterator.collect {
         case (role, VersionedRoleState(_, OffersWanted)) if !lastState.get(role).exists(_.roleState.isWanted) => role
-        case (role, VersionedRoleState(version, OffersWanted)) if lastOffersWantedVersion(lastState, role).exists(_ < version) => role
+        case (role, VersionedRoleState(version, OffersWanted)) if lastOffersWantedVersion(lastOffersState, role).exists(_ < version) => role
       }.toSet
 
       if (needsExplicitRevive.nonEmpty)
@@ -135,33 +177,43 @@ object ReviveOffersStreamLogic extends StrictLogging {
 
   private[impl] class ReviveDirectiveFlowLogicWithSuppression extends ReviveDirectiveFlowLogic {
 
-    private def offersNotWantedRoles(state: Map[Role, VersionedRoleState]): Set[Role] =
-      state.collect { case (role, VersionedRoleState(_, OffersNotWanted)) => role }.toSet
+    private def offersNotWantedRoles(state: OffersState): Set[Role] =
+      state.roleReviveVersions.collect { case (role, VersionedRoleState(_, OffersNotWanted)) => role }.toSet
 
-    def updateFrameworkNeeded(lastState: Map[Role, VersionedRoleState], newState: Map[Role, VersionedRoleState]) = {
-      val rolesChanged = lastState.keySet != newState.keySet
+    def updateFrameworkNeeded(lastState: OffersState, newState: OffersState) = {
+      val rolesChanged = lastState.roleReviveVersions.keySet != newState.roleReviveVersions.keySet
       val suppressedChanged = offersNotWantedRoles(lastState) != offersNotWantedRoles(newState)
-      rolesChanged || suppressedChanged
+      val constraintsChanged = lastState.offerConstraints != newState.offerConstraints
+      rolesChanged || suppressedChanged || constraintsChanged
     }
 
-    def directivesForDiff(lastState: Map[Role, VersionedRoleState], newState: Map[Role, VersionedRoleState]): List[RoleDirective] = {
+    def directivesForDiff(lastState: OffersState, newState: OffersState): List[RoleDirective] = {
       val directives = List.newBuilder[RoleDirective]
 
       if (updateFrameworkNeeded(lastState, newState)) {
-        val roleState = newState.map {
+        val lastRoleReviveVersions = lastState.roleReviveVersions
+        val newRoleReviveVersions = newState.roleReviveVersions
+
+        val roleState = newRoleReviveVersions.map {
           case (role, VersionedRoleState(_, state)) => role -> state
         }
-        val newlyWanted = newState.iterator.collect {
-          case (role, v) if v.roleState.isWanted && !lastState.get(role).exists(_.roleState.isWanted) => role
+        val newlyWanted = newRoleReviveVersions.iterator.collect {
+          case (role, v) if v.roleState.isWanted && !lastRoleReviveVersions.get(role).exists(_.roleState.isWanted) => role
         }.to(Set)
 
-        val newlyNotWanted = newState.iterator.collect {
-          case (role, v) if !v.roleState.isWanted && lastState.get(role).exists(_.roleState.isWanted) => role
+        val newlyNotWanted = newRoleReviveVersions.iterator.collect {
+          case (role, v) if !v.roleState.isWanted && lastRoleReviveVersions.get(role).exists(_.roleState.isWanted) => role
         }.to(Set)
-        directives += UpdateFramework(roleState, newlyRevived = newlyWanted, newlySuppressed = newlyNotWanted)
+
+        directives += UpdateFramework(
+          roleState,
+          newlyRevived = newlyWanted,
+          newlySuppressed = newlyNotWanted,
+          newState.offerConstraints
+        )
       }
 
-      val rolesNeedingRevive = newState.view.collect {
+      val rolesNeedingRevive = newState.roleReviveVersions.view.collect {
         case (role, VersionedRoleState(version, OffersWanted)) if lastOffersWantedVersion(lastState, role).exists(_ < version) => role
       }.toSet
 
@@ -182,7 +234,7 @@ object ReviveOffersStreamLogic extends StrictLogging {
           logic.processRoleDirective(directive)
           List(directive)
 
-        case Right(tick) =>
+        case Right(_: Tick.type) =>
           logic.handleTick()
       }
     }
@@ -244,12 +296,17 @@ object ReviveOffersStreamLogic extends StrictLogging {
 
   /**
     *
-    * @param roleState       The data specifying to which roles we should be subscribed, and which should be suppressed
-    * @param newlyRevived    Convenience metadata - Set of roles that were previously non-existent or suppressed
-    * @param newlySuppressed Convenience metadata - Set of roles that were previously not suppressed
+    * @param roleState        The data specifying to which roles we should be subscribed, and which should be suppressed
+    * @param newlyRevived     Convenience metadata - Set of roles that were previously non-existent or suppressed
+    * @param newlySuppressed  Convenience metadata - Set of roles that were previously not suppressed
+    * @param offerConstraints Mesos offer constraints by role
     */
-  case class UpdateFramework(roleState: Map[String, RoleOfferState], newlyRevived: Set[String], newlySuppressed: Set[String])
-      extends RoleDirective
+  case class UpdateFramework(
+      roleState: Map[String, RoleOfferState],
+      newlyRevived: Set[String],
+      newlySuppressed: Set[String],
+      offerConstraints: OfferConstraints.RoleState
+  ) extends RoleDirective
 
   case class IssueRevive(roles: Set[String]) extends RoleDirective
 

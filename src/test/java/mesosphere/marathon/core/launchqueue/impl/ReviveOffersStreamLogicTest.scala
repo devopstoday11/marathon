@@ -7,7 +7,15 @@ import akka.stream.scaladsl.{Flow, Keep, Sink, Source}
 import mesosphere.AkkaUnitTest
 import mesosphere.marathon.core.instance.update.{InstanceChangeOrSnapshot, InstanceUpdated, InstancesSnapshot}
 import mesosphere.marathon.core.instance.{Instance, TestInstanceBuilder}
-import mesosphere.marathon.core.launchqueue.impl.ReviveOffersStreamLogic.{DelayedStatus, IssueRevive, RoleDirective, UpdateFramework}
+import mesosphere.marathon.core.launchqueue.impl.ReviveOffersStreamLogic.{
+  DelayedStatus,
+  IssueRevive,
+  RoleDirective,
+  UpdateFramework,
+  OffersState
+}
+import mesosphere.marathon.core.launchqueue.impl.OfferConstraints
+
 import mesosphere.marathon.state.{AbsolutePathId, AppDefinition}
 import org.scalatest.Inside
 
@@ -42,7 +50,7 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
 
       Then("An update framework event is issued with the role suppressed in response to the snapshot")
       inside(output.pull().futureValue) {
-        case Some(UpdateFramework(roleState, newlyRevived, newlySuppressed)) =>
+        case Some(UpdateFramework(roleState, newlyRevived, newlySuppressed, _)) =>
           roleState shouldBe Map("web" -> OffersNotWanted)
           newlyRevived shouldBe Set.empty
           newlySuppressed shouldBe Set.empty
@@ -57,7 +65,7 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
 
       Then("The revives from the instances get combined in to a single update framework call")
       inside(output.pull().futureValue) {
-        case Some(UpdateFramework(roleState, newlyRevived, newlySuppressed)) =>
+        case Some(UpdateFramework(roleState, newlyRevived, newlySuppressed, _)) =>
           roleState shouldBe Map("web" -> OffersWanted)
           newlyRevived shouldBe Set("web")
           newlySuppressed shouldBe Set.empty
@@ -86,7 +94,7 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
         .futureValue
 
       inside(result) {
-        case Seq(UpdateFramework(roleState, newlyRevived, newlySuppressed)) =>
+        case Seq(UpdateFramework(roleState, newlyRevived, newlySuppressed, _)) =>
           roleState shouldBe Map("web" -> OffersWanted)
           newlyRevived shouldBe Set("web")
           newlySuppressed shouldBe Set.empty
@@ -98,7 +106,7 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
     "send a repeat after the second tick for roles newly revived by UpdateFramework" in {
       val logic = new ReviveOffersStreamLogic.ReviveRepeaterLogic
 
-      logic.processRoleDirective(UpdateFramework(Map("role" -> OffersWanted), Set("role"), Set.empty))
+      logic.processRoleDirective(UpdateFramework(Map("role" -> OffersWanted), Set("role"), Set.empty, OfferConstraints.RoleState.empty))
 
       logic.handleTick() shouldBe Nil
       logic.handleTick() shouldBe List(IssueRevive(Set("role")))
@@ -107,10 +115,10 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
     "does not repeat revives for roles that become suppressed" in {
       val logic = new ReviveOffersStreamLogic.ReviveRepeaterLogic
 
-      logic.processRoleDirective(UpdateFramework(Map("role" -> OffersWanted), Set("role"), Set.empty))
+      logic.processRoleDirective(UpdateFramework(Map("role" -> OffersWanted), Set("role"), Set.empty, OfferConstraints.RoleState.empty))
       logic.handleTick() shouldBe Nil
 
-      logic.processRoleDirective(UpdateFramework(Map("role" -> OffersNotWanted), Set.empty, Set("role")))
+      logic.processRoleDirective(UpdateFramework(Map("role" -> OffersNotWanted), Set.empty, Set("role"), OfferConstraints.RoleState.empty))
 
       logic.handleTick() shouldBe Nil
       logic.handleTick() shouldBe Nil
@@ -120,7 +128,7 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
     "send a repeat revive once after the second tick" in {
       val logic = new ReviveOffersStreamLogic.ReviveRepeaterLogic
 
-      logic.processRoleDirective(UpdateFramework(Map("role" -> OffersWanted), Set("role"), Set.empty))
+      logic.processRoleDirective(UpdateFramework(Map("role" -> OffersWanted), Set("role"), Set.empty, OfferConstraints.RoleState.empty))
       logic.handleTick() shouldBe Nil
 
       // First repeat for update framework
@@ -141,7 +149,7 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
     val suppressReviveFlow: Flow[Either[InstanceChangeOrSnapshot, ReviveOffersStreamLogic.DelayedStatus], RoleDirective, NotUsed] =
       ReviveOffersStreamLogic
         .reviveStateFromInstancesAndDelays("web")
-        .map(_.roleReviveVersions)
+        .map((revive: ReviveOffersState) => OffersState(revive.roleReviveVersions, OfferConstraints.RoleState.empty))
         .via(ReviveOffersStreamLogic.reviveDirectiveFlow(enableSuppress = true))
 
     "issues a suppress for the default role in response to an empty snapshot" in {
@@ -151,7 +159,7 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
         .futureValue
 
       inside(results) {
-        case Seq(UpdateFramework(roleState, newlyRevived, newlySuppressed)) =>
+        case Seq(UpdateFramework(roleState, newlyRevived, newlySuppressed, _)) =>
           roleState shouldBe Map("web" -> OffersNotWanted)
           newlyRevived shouldBe Set.empty
           newlySuppressed shouldBe Set.empty
@@ -167,7 +175,7 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
         .runWith(Sink.seq)
         .futureValue
       inside(results) {
-        case Seq(UpdateFramework(roleState, newlyRevived, newlySuppressed)) =>
+        case Seq(UpdateFramework(roleState, newlyRevived, newlySuppressed, _)) =>
           roleState shouldBe Map("web" -> OffersWanted)
           newlyRevived shouldBe Set("web")
           newlySuppressed shouldBe Set.empty
@@ -231,7 +239,7 @@ class ReviveOffersStreamLogicTest extends AkkaUnitTest with Inside {
           .futureValue
 
       inside(results) {
-        case Seq(UpdateFramework(roleState, newlyRevived, newlySuppressed)) =>
+        case Seq(UpdateFramework(roleState, newlyRevived, newlySuppressed, _)) =>
           roleState shouldBe Map("web" -> OffersNotWanted)
       }
     }
